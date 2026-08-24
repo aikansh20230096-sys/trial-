@@ -36,31 +36,51 @@ CUSTOM_CSS = """
     /* ---------- Global ---------- */
     .stApp {
         background-color: #0E1117;
-        color: #E6E6E6;
+        color: #FFFFFF;
     }
     html, body, [class*="css"]  {
         font-family: 'Inter', 'Segoe UI', 'Helvetica Neue', sans-serif;
+        color: #FFFFFF;
     }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
+
+    /* Force white text across all standard Streamlit text elements */
+    .stApp, .stApp p, .stApp span, .stApp div, .stApp label,
+    .stMarkdown, .stMarkdown p, .stMarkdown li, .stMarkdown a,
+    .stText, .stCaption, .stDataFrame, .stTable,
+    div[data-testid="stMarkdownContainer"],
+    div[data-testid="stMetricValue"],
+    div[data-testid="stMetricLabel"],
+    div[data-testid="stExpander"] summary,
+    .stSelectbox label, .stSlider label, .stTextInput label, .stNumberInput label,
+    .stRadio label, .stCheckbox label {
+        color: #FFFFFF !important;
+    }
+    .stCaption, small, [data-testid="stCaptionContainer"] {
+        color: #D6D9E0 !important;
+    }
 
     /* ---------- Sidebar ---------- */
     section[data-testid="stSidebar"] {
         background-color: #131722;
         border-right: 1px solid #262B3D;
     }
+    section[data-testid="stSidebar"] * {
+        color: #FFFFFF !important;
+    }
     section[data-testid="stSidebar"] .stTextInput input,
     section[data-testid="stSidebar"] .stNumberInput input {
         background-color: #1B2030;
-        color: #E6E6E6;
+        color: #FFFFFF !important;
         border: 1px solid #2E3448;
         border-radius: 8px;
     }
 
     /* ---------- Headings ---------- */
     h1, h2, h3, h4 {
-        color: #F5F7FA !important;
+        color: #FFFFFF !important;
         font-weight: 700 !important;
     }
     .app-title {
@@ -72,7 +92,7 @@ CUSTOM_CSS = """
         margin-bottom: 0px;
     }
     .app-subtitle {
-        color: #8A93A6;
+        color: #D6D9E0;
         font-size: 0.95rem;
         margin-top: -6px;
         margin-bottom: 18px;
@@ -88,7 +108,7 @@ CUSTOM_CSS = """
         height: 100%;
     }
     .metric-label {
-        color: #8A93A6;
+        color: #D6D9E0 !important;
         font-size: 0.80rem;
         font-weight: 600;
         text-transform: uppercase;
@@ -98,20 +118,20 @@ CUSTOM_CSS = """
     .metric-value {
         font-size: 1.65rem;
         font-weight: 800;
-        color: #F5F7FA;
+        color: #FFFFFF !important;
     }
     .metric-delta-positive {
-        color: #3ED598;
+        color: #3ED598 !important;
         font-size: 0.92rem;
         font-weight: 700;
     }
     .metric-delta-negative {
-        color: #FF5C7A;
+        color: #FF5C7A !important;
         font-size: 0.92rem;
         font-weight: 700;
     }
     .metric-delta-neutral {
-        color: #C9CDD8;
+        color: #FFFFFF !important;
         font-size: 0.92rem;
         font-weight: 700;
     }
@@ -125,7 +145,7 @@ CUSTOM_CSS = """
         margin: 18px 0 14px 0;
         font-size: 1.05rem;
         font-weight: 700;
-        color: #E6E6E6;
+        color: #FFFFFF !important;
     }
     .warn-banner {
         background: #2A1E12;
@@ -195,7 +215,8 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-DEFAULT_PEERS = "AAPL, MSFT, GOOGL, NVDA, AMZN"
+DEFAULT_MAIN_TICKER = "BAJFINANCE.NS"
+DEFAULT_PEERS = "SHRIRAMFIN.NS, CHOLAFIN.NS, MUTHOOTFIN.NS, TATACAPITAL.NS"
 
 INCOME_REVENUE_KEYS = ["Total Revenue", "TotalRevenue", "Revenue"]
 INCOME_EBIT_KEYS = ["EBIT", "Operating Income", "OperatingIncome"]
@@ -252,6 +273,8 @@ def fmt_money(value, symbol="$", decimals=2):
 
 
 def fmt_large(value, symbol="$"):
+    """Format large numbers. Indian Rupee values use the Lakh/Crore convention;
+    all other currencies use the standard K/M/B/T convention."""
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return "N/A"
     try:
@@ -259,6 +282,17 @@ def fmt_large(value, symbol="$"):
     except Exception:
         return "N/A"
     abs_v = abs(value)
+
+    if symbol == "₹":
+        # Indian numbering system: 1 Crore = 1e7, 1 Lakh = 1e5
+        if abs_v >= 1e7:
+            return f"₹{value / 1e7:,.2f} Cr"
+        if abs_v >= 1e5:
+            return f"₹{value / 1e5:,.2f} L"
+        if abs_v >= 1e3:
+            return f"₹{value / 1e3:,.2f} K"
+        return f"₹{value:,.2f}"
+
     if abs_v >= 1e12:
         return f"{symbol}{value / 1e12:,.2f}T"
     if abs_v >= 1e9:
@@ -403,13 +437,15 @@ with st.sidebar:
     st.markdown("---")
 
     main_ticker = st.text_input(
-        "Main Ticker", value="AAPL", help="e.g. AAPL, MSFT, RELIANCE.NS"
+        "Main Ticker",
+        value=DEFAULT_MAIN_TICKER,
+        help="NSE tickers use the .NS suffix (e.g. RELIANCE.NS, TCS.NS). BSE tickers use .BO (e.g. RELIANCE.BO).",
     ).strip().upper()
 
     peer_input = st.text_input(
         "Peer Tickers (comma-separated)",
         value=DEFAULT_PEERS,
-        help="e.g. AAPL, MSFT, GOOGL, NVDA, AMZN",
+        help="e.g. SHRIRAMFIN.NS, CHOLAFIN.NS, MUTHOOTFIN.NS, TATACAPITAL.NS",
     )
     peer_tickers = [p.strip().upper() for p in peer_input.split(",") if p.strip()]
     # Ensure main ticker is not duplicated inside the peer list for peer-only stats
@@ -423,6 +459,7 @@ with st.sidebar:
     st.markdown("---")
     st.caption(f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     st.caption("Data source: Yahoo Finance via `yfinance`")
+    st.caption("💡 NSE tickers: append **.NS** · BSE tickers: append **.BO**")
 
 if not main_ticker:
     st.warning("Please enter a main ticker in the sidebar to begin.")
@@ -433,7 +470,7 @@ if not main_ticker:
 # ============================================================================
 st.markdown('<div class="app-title">📊 Fundamental Valuation & Peer Multiples Dashboard</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="app-subtitle">DCF intrinsic valuation, sensitivity analysis, and peer-relative multiples — powered by live market data.</div>',
+    '<div class="app-subtitle">DCF intrinsic valuation, sensitivity analysis, and peer-relative multiples for NSE/BSE-listed (and global) equities — powered by live market data.</div>',
     unsafe_allow_html=True,
 )
 
