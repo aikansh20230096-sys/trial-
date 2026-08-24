@@ -7,6 +7,7 @@ multiples analysis, powered by live data from yfinance.
 Run with:  streamlit run app.py
 """
 
+import time
 import warnings
 from datetime import datetime
 
@@ -17,6 +18,41 @@ import streamlit as st
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
+
+# ============================================================================
+# NETWORK SESSION — improves reliability against Yahoo Finance rate-limiting
+# ============================================================================
+# Yahoo Finance aggressively rate-limits/blocks plain `requests` sessions
+# coming from cloud/data-center IPs (e.g. Streamlit Cloud). Using a
+# browser-impersonating session via `curl_cffi` (if installed) significantly
+# improves reliability. Falls back gracefully to yfinance's default session
+# if `curl_cffi` isn't available.
+try:
+    from curl_cffi import requests as _cffi_requests
+
+    def _build_session():
+        try:
+            return _cffi_requests.Session(impersonate="chrome")
+        except Exception:
+            return None
+
+except ImportError:  # curl_cffi not installed — fine, fall back silently
+    def _build_session():
+        return None
+
+
+_YF_SESSION = _build_session()
+
+
+def _get_ticker(symbol: str) -> yf.Ticker:
+    """Construct a yfinance Ticker, using the impersonated session when available."""
+    if _YF_SESSION is not None:
+        try:
+            return yf.Ticker(symbol, session=_YF_SESSION)
+        except Exception:
+            pass
+    return yf.Ticker(symbol)
+
 
 # ============================================================================
 # PAGE CONFIG
@@ -385,38 +421,91 @@ def series_values_recent_first(row, n):
 # ============================================================================
 # CACHED DATA FETCHERS
 # ============================================================================
-@st.cache_data(ttl=3600, show_spinner=False)
+class DataFetchError(Exception):
+    """Raised when a ticker's data could not be retrieved after retries."""
+
+
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_info(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info
-        if not info or "symbol" not in info and "shortName" not in info:
-            return {}
-        return info
-    except Exception:
-        return {}
+    """Fetch company info with retries and a `fast_info` fallback.
+
+    Raises DataFetchError on total failure instead of returning {} — this is
+    important because `st.cache_data` never caches an exception, so a
+    transient Yahoo Finance hiccup (rate limiting, momentary timeout) can be
+    retried on the very next rerun instead of being "stuck" as a cached
+    empty result for the full TTL window.
+    """
+    last_err = None
+    for attempt in range(3):
+        try:
+            t = _get_ticker(ticker)
+            info = None
+            try:
+                info = t.get_info()
+            except Exception as e:
+                last_err = e
+
+            if info and (info.get("symbol") or info.get("shortName") or info.get("longName")):
+                return info
+
+            # Fallback: fast_info is a lighter endpoint that is often
+            # reachable even when the full quoteSummary info call fails.
+            fi, last_price = None, None
+            try:
+                fi = t.fast_info
+                last_price = fi.get("lastPrice") if fi else None
+            except Exception as e:
+                last_err = e
+
+            if last_price is not None:
+                merged = dict(info) if info else {}
+                merged.setdefault("symbol", ticker)
+                merged.setdefault("shortName", ticker)
+                merged["currentPrice"] = last_price
+                merged["regularMarketPrice"] = last_price
+                merged.setdefault("marketCap", fi.get("marketCap") if fi else None)
+                merged.setdefault("currency", (fi.get("currency") if fi else None) or "USD")
+                return merged
+        except Exception as e:
+            last_err = e
+        time.sleep(0.6 * (attempt + 1))
+
+    raise DataFetchError(
+        f"Yahoo Finance did not return data for '{ticker}' after 3 attempts."
+        + (f" Last error: {last_err}" if last_err else "")
+    )
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_statements(ticker):
-    try:
-        t = yf.Ticker(ticker)
-        income = t.financials if t.financials is not None else pd.DataFrame()
-        balance = t.balance_sheet if t.balance_sheet is not None else pd.DataFrame()
-        cashflow = t.cashflow if t.cashflow is not None else pd.DataFrame()
-        return income, balance, cashflow
-    except Exception:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    last_err = None
+    for attempt in range(2):
+        try:
+            t = _get_ticker(ticker)
+            income = t.financials if t.financials is not None else pd.DataFrame()
+            balance = t.balance_sheet if t.balance_sheet is not None else pd.DataFrame()
+            cashflow = t.cashflow if t.cashflow is not None else pd.DataFrame()
+            if not income.empty or not balance.empty or not cashflow.empty:
+                return income, balance, cashflow
+        except Exception as e:
+            last_err = e
+        time.sleep(0.6 * (attempt + 1))
+    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_history(ticker, period="5y"):
-    try:
-        t = yf.Ticker(ticker)
-        hist = t.history(period=period)
-        return hist
-    except Exception:
-        return pd.DataFrame()
+    last_err = None
+    for attempt in range(2):
+        try:
+            t = _get_ticker(ticker)
+            hist = t.history(period=period)
+            if hist is not None and not hist.empty:
+                return hist
+        except Exception as e:
+            last_err = e
+        time.sleep(0.6 * (attempt + 1))
+    return pd.DataFrame()
 
 
 def current_price(ticker, info):
@@ -477,11 +566,25 @@ st.markdown(
 # ============================================================================
 # FETCH MAIN TICKER DATA
 # ============================================================================
-main_info = fetch_info(main_ticker)
+with st.spinner(f"Fetching data for {main_ticker}..."):
+    try:
+        main_info = fetch_info(main_ticker)
+        main_fetch_error = None
+    except DataFetchError as e:
+        main_info = {}
+        main_fetch_error = str(e)
+
 if not main_info:
     st.markdown(
-        f'<div class="error-banner">⚠️ Could not retrieve data for <b>{main_ticker}</b>. '
-        f'Please check the ticker symbol and try again.</div>',
+        f'<div class="error-banner">⚠️ Could not retrieve data for <b>{main_ticker}</b>.<br>'
+        f'{main_fetch_error or "The ticker may be invalid, or Yahoo Finance is temporarily unreachable."}<br><br>'
+        f'<b>Things to check:</b>'
+        f'<ul style="margin-top:6px;">'
+        f'<li>NSE tickers need the <code>.NS</code> suffix (e.g. <code>RELIANCE.NS</code>, <code>BAJFINANCE.NS</code>) '
+        f'and BSE tickers need <code>.BO</code> — a bare ticker like <code>RELIANCE</code> will not resolve.</li>'
+        f'<li>Double-check the symbol on <a href="https://finance.yahoo.com" target="_blank" style="color:#9FCBFF;">finance.yahoo.com</a>.</li>'
+        f'<li>Click "🔄 Refresh Data" in the sidebar to retry — this is often a transient rate-limit from Yahoo Finance.</li>'
+        f'</ul></div>',
         unsafe_allow_html=True,
     )
     st.stop()
@@ -854,31 +957,44 @@ with tab2:
     peer_rows = []
     fetch_errors = []
 
-    for tk in all_tickers:
-        info = fetch_info(tk) if tk != main_ticker else main_info
-        if not info:
-            fetch_errors.append(tk)
-            continue
-        row = {
-            "Ticker": tk,
-            "Company": info.get("shortName") or info.get("longName") or tk,
-            "Market Cap": safe_num(info.get("marketCap")),
-            "P/E (TTM)": safe_num(info.get("trailingPE")),
-            "Forward P/E": safe_num(info.get("forwardPE")),
-            "EV/EBITDA": safe_num(info.get("enterpriseToEbitda")),
-            "P/B": safe_num(info.get("priceToBook")),
-            "ROE (%)": safe_num(info.get("returnOnEquity")) * 100 if info.get("returnOnEquity") is not None else np.nan,
-            "D/E": safe_num(info.get("debtToEquity")),
-            "Op. Margin (%)": safe_num(info.get("operatingMargins")) * 100 if info.get("operatingMargins") is not None else np.nan,
-        }
-        peer_rows.append(row)
+    with st.spinner("Fetching peer data..."):
+        for idx, tk in enumerate(all_tickers):
+            if tk == main_ticker:
+                info = main_info
+            else:
+                try:
+                    info = fetch_info(tk)
+                except DataFetchError:
+                    info = {}
+                # Small stagger between sequential Yahoo Finance calls to
+                # reduce the chance of hitting rate limits on a peer batch.
+                if idx < len(all_tickers) - 1:
+                    time.sleep(0.25)
+            if not info:
+                fetch_errors.append(tk)
+                continue
+            row = {
+                "Ticker": tk,
+                "Company": info.get("shortName") or info.get("longName") or tk,
+                "Market Cap": safe_num(info.get("marketCap")),
+                "P/E (TTM)": safe_num(info.get("trailingPE")),
+                "Forward P/E": safe_num(info.get("forwardPE")),
+                "EV/EBITDA": safe_num(info.get("enterpriseToEbitda")),
+                "P/B": safe_num(info.get("priceToBook")),
+                "ROE (%)": safe_num(info.get("returnOnEquity")) * 100 if info.get("returnOnEquity") is not None else np.nan,
+                "D/E": safe_num(info.get("debtToEquity")),
+                "Op. Margin (%)": safe_num(info.get("operatingMargins")) * 100 if info.get("operatingMargins") is not None else np.nan,
+            }
+            peer_rows.append(row)
 
     if fetch_errors:
         st.markdown(
             f'<div class="warn-banner">⚠️ Could not retrieve data for: {", ".join(fetch_errors)}. '
-            f'These tickers were excluded from the analysis.</div>',
+            f'These tickers were excluded from the analysis. This is often a transient Yahoo Finance '
+            f'rate-limit — try "🔄 Refresh Data" in the sidebar in a moment.</div>',
             unsafe_allow_html=True,
         )
+
 
     if not peer_rows:
         st.markdown('<div class="error-banner">⚠️ No peer data could be retrieved.</div>', unsafe_allow_html=True)
