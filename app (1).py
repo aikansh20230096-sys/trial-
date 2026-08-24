@@ -1038,7 +1038,7 @@ with tab3:
         display = df.copy()
         display = display[sorted_columns(display)]
         display.columns = [pd.to_datetime(c).strftime("%Y-%m-%d") if not isinstance(c, str) else c for c in display.columns]
-        formatted = display.applymap(lambda v: fmt_large(v, main_currency) if pd.notnull(v) else "N/A")
+        formatted = display.map(lambda v: fmt_large(v, main_currency) if pd.notnull(v) else "N/A")
         st.dataframe(formatted, use_container_width=True, height=420)
 
     sub1, sub2, sub3 = st.tabs(["Income Statement", "Balance Sheet", "Cash Flow Statement"])
